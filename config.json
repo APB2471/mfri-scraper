@@ -1,0 +1,18 @@
+{
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "use_tls": true,
+    "username": "your_alert_account@gmail.com",
+    "password": "your_16_char_app_password",
+    "sender_email": "your_alert_account@gmail.com"
+  },
+  "to_emails": [
+    "primary_recipient@example.com",
+    "training_officer@example.com"
+  ],
+  "cc_emails": [
+    "chief@example.com",
+    "backup_admin@example.com"
+  ]
+}
