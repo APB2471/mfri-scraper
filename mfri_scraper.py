@@ -1,70 +1,62 @@
 #!/usr/bin/env python3
 """
 MFRI Initial EMT (EMS-106) Schedule Monitor
-Stateless, cron-friendly scraper with atomic state persistence and SMTP alerts.
+Hardened stateless scraper with flock concurrency control, verified TLS,
+DOM sanity checks, registration-open transition tracking, and atomic state saves.
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import re
+import shutil
 import smtplib
+import ssl
 import sys
 import tempfile
+from datetime import date, datetime
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
-# Constants & Paths
+# Paths & Constants
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
-STATE_PATH = BASE_DIR / "seen_courses.json"
+PROD_STATE_PATH = BASE_DIR / "seen_courses.json"
+TEST_STATE_PATH = BASE_DIR / "seen_courses.test.json"
+HEALTH_PATH = BASE_DIR / "health.json"
+LOCK_PATH = BASE_DIR / "scraper.lock"
 LOG_PATH = BASE_DIR / "scraper.log"
 DEFAULT_MOCK_PATH = BASE_DIR / "mock_schedule.html"
 
 TARGET_URL = "https://www.mfri.org/schedule/msfs/"
 REQUEST_TIMEOUT = 15
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "close",
-}
-
-# Strict filtering patterns
+# Authoritative ID patterns
 INITIAL_EMT_ID_RE = re.compile(r"\b(EMS-106-[A-Z0-9]+-\d{4})\b", re.IGNORECASE)
 EXCLUDED_CODE_RE = re.compile(r"\bEMS-(?:216|217|218|338|343)\b", re.IGNORECASE)
-EXCLUDED_TITLE_KEYWORDS = (
-    "recertification",
-    "refresher",
-    "continuing education",
-    "skills",
-    "proficiency",
-    "online continuing",
-)
 
-# Field extraction patterns matching live MFRI text output
-START_DATE_RE = re.compile(r"Start Date:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})", re.IGNORECASE)
-END_DATE_RE = re.compile(r"End Date:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})", re.IGNORECASE)
-SINGLE_DATE_RE = re.compile(r"\bDate:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})", re.IGNORECASE)
+# Field extraction patterns
+START_DATE_RE = re.compile(r"Start Date:\s*(\d{2}-\d{2}-\d{4})", re.IGNORECASE)
+END_DATE_RE = re.compile(r"End Date:\s*(\d{2}-\d{2}-\d{4})", re.IGNORECASE)
+SINGLE_DATE_RE = re.compile(r"\bDate:\s*(\d{2}-\d{2}-\d{4})", re.IGNORECASE)
 CLASS_TIME_RE = re.compile(
-    r"(?:First Class Time|Time):\s*([0-9]{2}:[0-9]{2}\s*-\s*[0-9]{2}:[0-9]{2})",
-    re.IGNORECASE,
+    r"(?:First Class Time|Time):\s*(\d{2}:\d{2}\s*-\s*\d{2}:\d{2})", re.IGNORECASE
 )
-REG_CLOSE_RE = re.compile(
-    r"Registration Close:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})", re.IGNORECASE
-)
+REG_OPEN_RE = re.compile(r"Registration Open:\s*(\d{2}-\d{2}-\d{4})", re.IGNORECASE)
+REG_CLOSE_RE = re.compile(r"Registration Close:\s*(\d{2}-\d{2}-\d{4})", re.IGNORECASE)
 DAYS_RE = re.compile(
     r"\b((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)s?"
     r"(?:(?:,\s*|\s+and\s+)(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)s?)*)\b",
@@ -73,9 +65,9 @@ DAYS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Logging Setup
+# Logging
 # ---------------------------------------------------------------------------
-def setup_logging() -> logging.Logger:
+def setup_logging(verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("mfri_scraper")
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter(
@@ -84,21 +76,53 @@ def setup_logging() -> logging.Logger:
     )
 
     if not logger.handlers:
-        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        rotating_handler = RotatingFileHandler(
+            LOG_PATH, maxBytes=1_048_576, backupCount=5, encoding="utf-8"
+        )
+        rotating_handler.setFormatter(formatter)
+        logger.addHandler(rotating_handler)
 
-        stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(stream_handler)
+        # Only attach stdout handler if run interactively or --verbose is passed
+        if verbose or sys.stdout.isatty():
+            stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler.setFormatter(formatter)
+            logger.addHandler(stream_handler)
 
     return logger
 
 
 # ---------------------------------------------------------------------------
-# Configuration & Atomic State Management
+# Atomic File I/O & State Management
 # ---------------------------------------------------------------------------
-def load_config(config_path: Path, logger: logging.Logger) -> Dict:
+def atomic_write_json(target_path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically write JSON and fsync both the file and parent directory."""
+    parent_dir = target_path.parent
+    temp_fd, temp_path = tempfile.mkstemp(
+        dir=str(parent_dir), prefix=f".{target_path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(payload, tmp_file, indent=2, sort_keys=True)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(temp_path, target_path)
+
+        # fsync parent directory entry for SD card power-loss resilience
+        dir_fd = os.open(str(parent_dir), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+
+def load_config(config_path: Path) -> Dict[str, Any]:
     if not config_path.exists():
         raise FileNotFoundError(f"Configuration file missing: {config_path}")
 
@@ -106,10 +130,13 @@ def load_config(config_path: Path, logger: logging.Logger) -> Dict:
         config = json.load(f)
 
     smtp_cfg = config.get("smtp", {})
-    required_smtp = ["host", "port", "username", "password", "sender_email"]
-    for key in required_smtp:
-        if key not in smtp_cfg or smtp_cfg[key] in ("", None):
+    for key in ("host", "port", "username", "password", "sender_email"):
+        if not smtp_cfg.get(key):
             raise ValueError(f"Missing required smtp.{key} in {config_path}")
+
+    security = smtp_cfg.get("security", "starttls").lower()
+    if security not in ("starttls", "ssl", "none"):
+        raise ValueError("smtp.security must be 'starttls', 'ssl', or 'none'")
 
     to_emails = config.get("to_emails", [])
     if not isinstance(to_emails, list) or not to_emails:
@@ -122,173 +149,233 @@ def load_config(config_path: Path, logger: logging.Logger) -> Dict:
     return config
 
 
-def load_seen_courses(state_path: Path, logger: logging.Logger) -> Set[str]:
+def load_seen_courses(state_path: Path, logger: logging.Logger) -> Dict[str, Dict[str, str]]:
+    """
+    Return dict mapping course_id -> {"status": str, "updated_at": str}.
+    If corrupted, preserve backup and raise RuntimeError to prevent re-alert floods.
+    """
     if not state_path.exists():
-        return set()
+        return {}
+
     try:
         with state_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict) and "seen_ids" in data:
-                return set(data["seen_ids"])
-            if isinstance(data, list):
-                return set(data)
-            return set()
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.error("Corrupted state file %s (%s). Starting fresh.", state_path, exc)
-        return set()
+    except json.JSONDecodeError as exc:
+        backup_path = state_path.with_suffix(state_path.suffix + ".bak")
+        shutil.copy2(state_path, backup_path)
+        logger.critical(
+            "State file %s is corrupted! Backed up to %s and aborting to prevent duplicate alert flood.",
+            state_path,
+            backup_path,
+        )
+        raise RuntimeError(f"Corrupted state file: {state_path}") from exc
+
+    # Backwards compatibility with older {"seen_ids": [...]} format
+    if isinstance(data, dict) and "courses" in data and isinstance(data["courses"], dict):
+        return data["courses"]
+    if isinstance(data, dict) and "seen_ids" in data and isinstance(data["seen_ids"], list):
+        return {cid: {"status": "Legacy", "updated_at": ""} for cid in data["seen_ids"]}
+    raise RuntimeError(f"Unexpected schema in state file: {state_path}")
 
 
-def save_seen_courses_atomic(
-    state_path: Path, seen_ids: Set[str], logger: logging.Logger
+def save_seen_courses(
+    state_path: Path, courses_state: Dict[str, Dict[str, str]]
 ) -> None:
-    """Write state to a temp file, fsync, and atomically replace target file."""
-    payload = {"seen_ids": sorted(seen_ids)}
-    temp_fd, temp_path = tempfile.mkstemp(
-        dir=str(state_path.parent), prefix=".seen_courses_", suffix=".tmp"
-    )
+    atomic_write_json(state_path, {"courses": courses_state})
+
+
+def update_health(
+    success: bool, error_msg: str, config: Dict[str, Any], logger: logging.Logger
+) -> None:
+    """Track consecutive fetch/parse failures and send an admin alert at threshold."""
+    health = {"consecutive_failures": 0, "last_error": "", "alert_sent": False}
+    if HEALTH_PATH.exists():
+        try:
+            health.update(json.loads(HEALTH_PATH.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    if success:
+        if health["consecutive_failures"] > 0:
+            atomic_write_json(
+                HEALTH_PATH,
+                {"consecutive_failures": 0, "last_error": "", "alert_sent": False},
+            )
+        return
+
+    health["consecutive_failures"] += 1
+    health["last_error"] = error_msg
+    threshold = int(config.get("failure_alert_threshold", 3))
+
+    if health["consecutive_failures"] >= threshold and not health.get("alert_sent"):
+        try:
+            send_email(
+                subject=f"[MFRI Scraper ERROR] {health['consecutive_failures']} Consecutive Failures",
+                body=(
+                    f"The MFRI EMT schedule scraper has failed {health['consecutive_failures']} "
+                    f"consecutive times.\n\nLatest Error:\n{error_msg}\n\n"
+                    f"Please inspect {LOG_PATH} and verify {TARGET_URL}."
+                ),
+                config=config,
+                logger=logger,
+            )
+            health["alert_sent"] = True
+        except Exception as exc:
+            logger.error("Failed to send health alert email: %s", exc)
+
     try:
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as tmp_file:
-            json.dump(payload, tmp_file, indent=2)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(temp_path, state_path)
+        atomic_write_json(HEALTH_PATH, health)
     except Exception as exc:
-        logger.error("Atomic write to %s failed: %s", state_path, exc)
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        raise
+        logger.error("Failed to write health file: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Fetching & HTML Parsing
+# HTTP Fetching with Backoff
 # ---------------------------------------------------------------------------
 def fetch_html(
-    test_mode: bool, mock_path: Path, logger: logging.Logger
-) -> Optional[str]:
+    test_mode: bool, mock_path: Path, config: Dict[str, Any], logger: logging.Logger
+) -> str:
     if test_mode:
         logger.info("Running in LOCAL TEST mode using %s", mock_path)
         if not mock_path.exists():
-            logger.error("Mock HTML file not found at %s", mock_path)
-            return None
+            raise FileNotFoundError(f"Mock HTML file not found: {mock_path}")
         return mock_path.read_text(encoding="utf-8")
 
+    headers = {
+        "User-Agent": config.get(
+            "user_agent", "MFRI-EMT-ScheduleMonitor/2.0 (RaspberryPi)"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+    session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+
     logger.info("Fetching live MFRI schedule from %s", TARGET_URL)
-    try:
-        response = requests.get(
-            TARGET_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as exc:
-        logger.error("Network error while fetching MFRI schedule: %s", exc)
-        return None
+    response = session.get(TARGET_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.text
 
 
-def clean_title_text(raw_text: str) -> str:
+# ---------------------------------------------------------------------------
+# HTML Parsing & Filtering
+# ---------------------------------------------------------------------------
+def clean_more_arrow(raw_text: str) -> str:
     text = re.sub(r"More\s*(?:→|&rarr;|\u2192).*", "", raw_text, flags=re.IGNORECASE)
     return " ".join(text.split()).strip()
 
 
-def resolve_course_title(item_div: Tag) -> str:
-    """
-    Locate the course title either inside the event-item div or from the nearest
-    preceding heading/section header on the MFRI schedule page.
-    """
-    for tag_name in ("h2", "h3", "h4"):
-        internal_heading = item_div.find(tag_name)
-        if internal_heading:
-            return clean_title_text(internal_heading.get_text(" ", strip=True))
-
-    prev_heading = item_div.find_previous(["h2", "h3", "h4"])
-    if prev_heading:
-        return clean_title_text(prev_heading.get_text(" ", strip=True))
-
-    return ""
-
-
-def is_initial_emt_course(course_title: str, block_text: str) -> bool:
-    """
-    Strictly allow only initial Emergency Medical Technician (EMS-106) courses.
-    Explicitly reject EMS-216, EMS-217, EMS-218, refreshers, recerts, and CEUs.
-    """
+def is_initial_emt_course(block_text: str) -> bool:
+    """Authoritative filtering by EMS-106 course ID and explicit exclusion list."""
     if EXCLUDED_CODE_RE.search(block_text):
         return False
-
-    if not INITIAL_EMT_ID_RE.search(block_text):
-        return False
-
-    combined_lower = f"{course_title} {block_text}".lower()
-    for keyword in EXCLUDED_TITLE_KEYWORDS:
-        if keyword in course_title.lower():
-            return False
-
-    if course_title:
-        normalized_title = course_title.strip().lower()
-        if normalized_title != "emergency medical technician":
-            return False
-    else:
-        if "emergency medical technician" not in combined_lower:
-            return False
-
-    return True
+    return bool(INITIAL_EMT_ID_RE.search(block_text))
 
 
-def extract_location(item_div: Tag, lines: List[str]) -> str:
-    """
-    Extract facility location. On MFRI schedules, the location appears right after
-    'Registration Close:' and before 'Coordinated by:'.
-    """
-    for idx, line in enumerate(lines):
-        if line.lower().startswith("registration close:"):
-            for candidate in lines[idx + 1 : idx + 4]:
-                cleaned = clean_title_text(candidate)
-                if cleaned and not cleaned.lower().startswith("coordinated by"):
-                    return cleaned
+def resolve_course_title(item_div: Tag) -> str:
+    """Use preceding <h2> as display metadata; default cleanly if absent."""
+    h2 = item_div.find_previous("h2")
+    if h2:
+        cleaned = clean_more_arrow(h2.get_text(" ", strip=True))
+        if cleaned.lower().startswith("emergency medical technician"):
+            return cleaned
+    return "Emergency Medical Technician"
 
-    for idx, line in enumerate(lines):
-        if line.lower().startswith("coordinated by:") and idx > 0:
-            cleaned = clean_title_text(lines[idx - 1])
-            if cleaned and not cleaned.lower().startswith("registration"):
-                return cleaned
 
+def extract_location(item_div: Tag) -> str:
+    """Extract location from the parent container of the /location link."""
+    loc_link = item_div.find("a", href=re.compile(r"/location", re.IGNORECASE))
+    if loc_link:
+        container = loc_link.parent if loc_link.parent else loc_link
+        txt = clean_more_arrow(container.get_text(" ", strip=True))
+        if txt:
+            return txt
     return "Location not specified"
 
 
-def extract_registration_url(item_div: Tag) -> str:
-    """Extract the direct registration URL or fallback to the course details URL."""
-    fallback_url = TARGET_URL
+def parse_mmddyyyy(date_str: Optional[str]) -> Optional[date]:
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%m-%d-%Y").date()
+    except ValueError:
+        return None
+
+
+def extract_registration_info(
+    item_div: Tag,
+    block_text: str,
+    reg_open_str: Optional[str],
+    reg_close_str: Optional[str],
+    today: date,
+) -> Dict[str, str]:
+    """
+    Determine accurate registration URL and status by inspecting both link text
+    ('Register' vs 'Wait List') and comparing Registration Open/Close dates to today.
+    """
+    reg_url = TARGET_URL
+    link_label = ""
+
     for anchor in item_div.find_all("a", href=True):
-        link_text = " ".join(anchor.get_text().split()).lower()
         href = anchor["href"].strip()
+        text_lower = " ".join(anchor.get_text().split()).lower()
         full_url = urljoin(TARGET_URL, href)
 
-        if "register" in link_text and "closed" not in link_text:
-            return full_url
-        if "more" in link_text and "/course/" in href:
-            fallback_url = full_url
+        if "/register/" in href.lower() or text_lower in ("register", "wait list"):
+            reg_url = full_url
+            link_label = text_lower
+            break
+        if "/course/" in href.lower() and reg_url == TARGET_URL:
+            reg_url = full_url
 
-    return fallback_url
+    open_date = parse_mmddyyyy(reg_open_str)
+    close_date = parse_mmddyyyy(reg_close_str)
+    text_lower_all = block_text.lower()
+
+    if "registration is closed" in text_lower_all or (close_date and today > close_date):
+        status = "Closed"
+    elif open_date and today < open_date:
+        status = f"Upcoming (Opens {reg_open_str})"
+    elif "wait list" in link_label or "wait list" in text_lower_all:
+        status = "Wait List"
+    elif link_label == "register":
+        status = "Open"
+    else:
+        status = "Unknown"
+
+    return {"registration_url": reg_url, "registration_status": status}
 
 
-def parse_emt_courses(html_content: str, logger: logging.Logger) -> List[Dict[str, str]]:
+def parse_schedule_html(
+    html_content: str, today: date, logger: logging.Logger
+) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html_content, "html.parser")
     event_items = soup.find_all(
         "div",
         class_=lambda c: c and "row" in c.split() and "event-item" in c.split(),
     )
-    logger.info("Found %d <div class='row event-item'> blocks.", len(event_items))
+
+    if not event_items:
+        raise ValueError(
+            "DOM check failed: 0 <div class='row event-item'> blocks found on page."
+        )
+
+    logger.info("Found %d event-item blocks on schedule page.", len(event_items))
 
     courses: List[Dict[str, str]] = []
-    seen_in_parse: Set[str] = set()
+    seen_in_parse = set()
 
     for item in event_items:
         block_text = item.get_text("\n", strip=True)
-        course_title = resolve_course_title(item)
-
-        if not is_initial_emt_course(course_title, block_text):
+        if not is_initial_emt_course(block_text):
             continue
 
         id_match = INITIAL_EMT_ID_RE.search(block_text)
@@ -300,35 +387,33 @@ def parse_emt_courses(html_content: str, logger: logging.Logger) -> List[Dict[st
             continue
         seen_in_parse.add(course_id)
 
-        lines = [
-            " ".join(line.split())
-            for line in block_text.splitlines()
-            if line.strip()
-        ]
-
         start_match = START_DATE_RE.search(block_text) or SINGLE_DATE_RE.search(block_text)
         end_match = END_DATE_RE.search(block_text)
         time_match = CLASS_TIME_RE.search(block_text)
+        reg_open_match = REG_OPEN_RE.search(block_text)
         reg_close_match = REG_CLOSE_RE.search(block_text)
         days_match = DAYS_RE.search(block_text)
 
-        reg_closed = "registration is closed" in block_text.lower()
-        reg_url = extract_registration_url(item)
+        reg_open_str = reg_open_match.group(1) if reg_open_match else None
+        reg_close_str = reg_close_match.group(1) if reg_close_match else None
+
+        reg_info = extract_registration_info(
+            item, block_text, reg_open_str, reg_close_str, today
+        )
 
         courses.append(
             {
                 "course_id": course_id,
-                "title": course_title or "Emergency Medical Technician",
-                "location": extract_location(item, lines),
+                "title": resolve_course_title(item),
+                "location": extract_location(item),
                 "start_date": start_match.group(1) if start_match else "TBD",
                 "end_date": end_match.group(1) if end_match else "TBD",
                 "meeting_times": time_match.group(1) if time_match else "TBD",
                 "meeting_days": days_match.group(1) if days_match else "TBD",
-                "registration_deadline": (
-                    reg_close_match.group(1) if reg_close_match else "TBD"
-                ),
-                "registration_status": "Closed" if reg_closed else "Open",
-                "registration_url": reg_url,
+                "registration_open": reg_open_str or "TBD",
+                "registration_deadline": reg_close_str or "TBD",
+                "registration_status": reg_info["registration_status"],
+                "registration_url": reg_info["registration_url"],
             }
         )
 
@@ -337,31 +422,66 @@ def parse_emt_courses(html_content: str, logger: logging.Logger) -> List[Dict[st
 
 
 # ---------------------------------------------------------------------------
-# Email Notification
+# Verified SMTP Delivery
 # ---------------------------------------------------------------------------
-def send_email_alert(
-    course: Dict[str, str], config: Dict, logger: logging.Logger
+def send_email(
+    subject: str, body: str, config: Dict[str, Any], logger: logging.Logger
 ) -> None:
     smtp_cfg = config["smtp"]
     to_emails: List[str] = config["to_emails"]
     cc_emails: List[str] = config.get("cc_emails", [])
-
-    # Deduplicate envelope recipients while preserving header lists
     all_recipients = list(dict.fromkeys(to_emails + cc_emails))
 
     msg = EmailMessage()
-    msg["Subject"] = (
-        f"[MFRI Alert] New Initial EMT Course Posted: {course['course_id']} "
-        f"({course['location']})"
-    )
+    msg["Subject"] = subject
     msg["From"] = smtp_cfg["sender_email"]
     msg["To"] = ", ".join(to_emails)
     if cc_emails:
         msg["Cc"] = ", ".join(cc_emails)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.set_content(body)
 
+    host = smtp_cfg["host"]
+    port = int(smtp_cfg["port"])
+    security = smtp_cfg.get("security", "starttls").lower()
+    ssl_context = ssl.create_default_context()
+
+    if security == "ssl":
+        with smtplib.SMTP_SSL(
+            host, port, timeout=REQUEST_TIMEOUT, context=ssl_context
+        ) as server:
+            server.login(smtp_cfg["username"], smtp_cfg["password"])
+            refused = server.send_message(
+                msg, from_addr=smtp_cfg["sender_email"], to_addrs=all_recipients
+            )
+    else:
+        with smtplib.SMTP(host, port, timeout=REQUEST_TIMEOUT) as server:
+            server.ehlo()
+            if security == "starttls":
+                server.starttls(context=ssl_context)
+                server.ehlo()
+            server.login(smtp_cfg["username"], smtp_cfg["password"])
+            refused = server.send_message(
+                msg, from_addr=smtp_cfg["sender_email"], to_addrs=all_recipients
+            )
+
+    if refused:
+        logger.warning("Partial recipient refusal from SMTP server: %s", refused)
+
+
+def send_course_alert(
+    course: Dict[str, str],
+    event_reason: str,
+    config: Dict[str, Any],
+    logger: logging.Logger,
+) -> None:
+    subject = (
+        f"[MFRI {event_reason}] {course['course_id']} - {course['location']} "
+        f"({course['registration_status']})"
+    )
     body = (
-        f"A newly posted Initial Emergency Medical Technician (EMS-106) course "
-        f"was detected on the MFRI schedule.\n\n"
+        f"MFRI Initial Emergency Medical Technician (EMS-106) Alert: {event_reason}\n\n"
         f"Course Details:\n"
         f"------------------------------------------------------------\n"
         f"Course Title          : {course['title']}\n"
@@ -371,125 +491,156 @@ def send_email_alert(
         f"End Date              : {course['end_date']}\n"
         f"Meeting Times         : {course['meeting_times']}\n"
         f"Meeting Days          : {course['meeting_days']}\n"
+        f"Registration Open     : {course['registration_open']}\n"
         f"Registration Deadline : {course['registration_deadline']}\n"
         f"Registration Status   : {course['registration_status']}\n"
         f"Registration Link     : {course['registration_url']}\n"
         f"------------------------------------------------------------\n"
-        f"Full Schedule Page    : {TARGET_URL}\n"
+        f"Schedule URL          : {TARGET_URL}\n"
     )
-    msg.set_content(body)
-
-    host = smtp_cfg["host"]
-    port = int(smtp_cfg["port"])
-    use_tls = bool(smtp_cfg.get("use_tls", True))
-
     logger.info(
-        "Sending email alert for %s (To: %s | Cc: %s)",
+        "Sending '%s' alert for %s (Status: %s)",
+        event_reason,
         course["course_id"],
-        to_emails,
-        cc_emails,
+        course["registration_status"],
     )
-
-    if port == 465 and not use_tls:
-        with smtplib.SMTP_SSL(host, port, timeout=REQUEST_TIMEOUT) as server:
-            server.login(smtp_cfg["username"], smtp_cfg["password"])
-            server.send_message(msg, from_addr=smtp_cfg["sender_email"], to_addrs=all_recipients)
-    else:
-        with smtplib.SMTP(host, port, timeout=REQUEST_TIMEOUT) as server:
-            server.ehlo()
-            if use_tls:
-                server.starttls()
-                server.ehlo()
-            server.login(smtp_cfg["username"], smtp_cfg["password"])
-            server.send_message(msg, from_addr=smtp_cfg["sender_email"], to_addrs=all_recipients)
-
-    logger.info("Successfully delivered alert for %s.", course["course_id"])
+    send_email(subject, body, config, logger)
 
 
 # ---------------------------------------------------------------------------
-# Entry Point
+# Main Execution
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Monitor MFRI schedule for new initial EMT (EMS-106) courses."
+        description="Monitor MFRI schedule for initial EMT (EMS-106) courses."
     )
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Parse local mock_schedule.html instead of querying live MFRI website.",
+        help="Parse local mock_schedule.html and use isolated seen_courses.test.json.",
     )
     parser.add_argument(
         "--mock-file",
         type=Path,
         default=DEFAULT_MOCK_PATH,
-        help="Path to custom mock HTML file when using --test.",
+        help="Custom mock HTML path for --test mode.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Parse and log new courses without sending SMTP emails.",
+        help="Parse and log alerts without sending emails or modifying state files.",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Seed seen_courses.json with currently posted courses without sending emails.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Force log output to stdout even when non-interactive.",
     )
     args = parser.parse_args()
 
-    logger = setup_logging()
-    logger.info("Starting MFRI EMT scraper run.")
+    logger = setup_logging(verbose=args.verbose)
+
+    # 1. Prevent overlapping cron executions via non-blocking flock
+    lock_file = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.warning("Another scraper instance is currently running; exiting.")
+        return 0
 
     try:
-        config = load_config(CONFIG_PATH, logger)
+        config = load_config(CONFIG_PATH)
     except Exception as exc:
         logger.error("Configuration error: %s", exc)
         return 1
 
-    seen_ids = load_seen_courses(STATE_PATH, logger)
-    html_content = fetch_html(args.test, args.mock_file, logger)
-    if not html_content:
-        logger.warning("No HTML content retrieved; exiting cleanly without state mutation.")
-        return 0
+    state_path = TEST_STATE_PATH if args.test else PROD_STATE_PATH
 
     try:
-        courses = parse_emt_courses(html_content, logger)
-    except Exception as exc:
-        logger.exception("Unexpected error parsing HTML: %s", exc)
-        return 1
+        seen_courses = load_seen_courses(state_path, logger)
+    except RuntimeError:
+        return 3
 
-    new_courses = [c for c in courses if c["course_id"] not in seen_ids]
-    if not new_courses:
-        logger.info("No new initial EMT (EMS-106) courses found.")
+    # 2. Fetch and parse HTML with health monitoring
+    try:
+        html_content = fetch_html(args.test, args.mock_file, config, logger)
+        courses = parse_schedule_html(html_content, date.today(), logger)
+        if not args.test:
+            update_health(True, "", config, logger)
+    except Exception as exc:
+        logger.error("Fetch/Parse failure: %s", exc)
+        if not args.test:
+            update_health(False, str(exc), config, logger)
+        return 2
+
+    # 3. Baseline seeding mode (no emails sent)
+    if args.baseline:
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        for c in courses:
+            seen_courses[c["course_id"]] = {
+                "status": c["registration_status"],
+                "updated_at": now_iso,
+            }
+        save_seen_courses(state_path, seen_courses)
+        logger.info(
+            "Baseline seeded %d course(s) into %s without sending emails.",
+            len(courses),
+            state_path.name,
+        )
         return 0
 
-    state_updated = False
-    for course in new_courses:
+    # 4. Evaluate new courses and Upcoming -> Open registration transitions
+    smtp_failures = 0
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
+    for course in courses:
         cid = course["course_id"]
-        logger.info(
-            "NEW COURSE DETECTED: %s at %s (%s to %s)",
-            cid,
-            course["location"],
-            course["start_date"],
-            course["end_date"],
-        )
+        curr_status = course["registration_status"]
+        prev_entry = seen_courses.get(cid)
+
+        event_reason: Optional[str] = None
+        if prev_entry is None:
+            event_reason = "NEW COURSE"
+        elif prev_entry.get("status", "").startswith("Upcoming") and curr_status in (
+            "Open",
+            "Wait List",
+        ):
+            event_reason = "REGISTRATION OPENED"
+
+        if not event_reason:
+            # Quietly keep non-alerting status changes synced
+            if not args.dry_run and prev_entry.get("status") != curr_status:
+                seen_courses[cid] = {"status": curr_status, "updated_at": now_iso}
+                save_seen_courses(state_path, seen_courses)
+            continue
+
         if args.dry_run:
-            logger.info("[DRY-RUN] Skipping email delivery for %s.", cid)
-            seen_ids.add(cid)
-            state_updated = True
+            logger.info(
+                "[DRY-RUN] Would alert '%s' for %s (%s at %s)",
+                event_reason,
+                cid,
+                curr_status,
+                course["location"],
+            )
             continue
 
         try:
-            send_email_alert(course, config, logger)
-            seen_ids.add(cid)
-            state_updated = True
+            send_course_alert(course, event_reason, config, logger)
+            # Save state immediately after each successful send
+            seen_courses[cid] = {"status": curr_status, "updated_at": now_iso}
+            save_seen_courses(state_path, seen_courses)
         except Exception as exc:
-            logger.error(
-                "SMTP failure for %s (%s). Will retry on next cron run.", cid, exc
-            )
+            smtp_failures += 1
+            logger.error("SMTP failure for %s (%s). Will retry next run.", cid, exc)
 
-    if state_updated:
-        try:
-            save_seen_courses_atomic(STATE_PATH, seen_ids, logger)
-            logger.info("Updated seen_courses.json with %d total course(s).", len(seen_ids))
-        except Exception:
-            return 1
+    if smtp_failures > 0:
+        return 1
 
-    logger.info("MFRI EMT scraper run completed.")
+    logger.info("Scraper run finished cleanly.")
     return 0
 
 

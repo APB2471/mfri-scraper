@@ -1,18 +1,18 @@
 {
+  "user_agent": "MFRI-EMT-ScheduleMonitor/2.0 (+mailto:your_alert_account@gmail.com)",
+  "failure_alert_threshold": 3,
   "smtp": {
     "host": "smtp.gmail.com",
     "port": 587,
-    "use_tls": true,
+    "security": "starttls",
     "username": "your_alert_account@gmail.com",
     "password": "your_16_char_app_password",
     "sender_email": "your_alert_account@gmail.com"
   },
   "to_emails": [
-    "primary_recipient@example.com",
-    "training_officer@example.com"
+    "primary_recipient@example.com"
   ],
   "cc_emails": [
-    "chief@example.com",
-    "backup_admin@example.com"
+    "chief@example.com"
   ]
 }

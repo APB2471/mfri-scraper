@@ -53,3 +53,32 @@ Bash
 rm -f seen_courses.json
 ./venv/bin/python mfri_scraper.py --test
 Expected Output: Connects to your configured SMTP server, sends structured alert emails with both To and Cc headers populated, delivers to all envelope addresses in to_emails and cc_emails, and persists the course IDs to seen_courses.json.
+
+MORE
+
+4. Updated Deployment & Verification Workflow
+1. Seed Production Baseline Before Enabling Cron
+Prevents the initial run from emailing you about already-posted courses on the live site:
+
+Bash
+cd /home/pi/mfri_scraper
+./venv/bin/python mfri_scraper.py --baseline --verbose
+2. Isolated Local Testing (seen_courses.test.json)
+Running --test or --dry-run will never touch production seen_courses.json:
+
+Bash
+# Step A: Verify parsing, location extraction, and registration status logic without sending email
+./venv/bin/python mfri_scraper.py --test --dry-run --verbose
+
+# Step B: Test end-to-end SMTP delivery (writes only to seen_courses.test.json)
+rm -f seen_courses.test.json
+./venv/bin/python mfri_scraper.py --test --verbose
+
+# Step C: Verify Upcoming -> Open transition alert
+# Edit mock_schedule.html and change EMS-106-S010-2027 Registration Open to 10-01-2026, then run:
+./venv/bin/python mfri_scraper.py --test --verbose
+3. Cron Configuration (crontab -e)
+Polls every 30 minutes. Standard output is silent unless an unhandled interpreter crash occurs; application logs rotate automatically inside /home/pi/mfri_scraper/scraper.log:
+
+Cron command
+*/30 * * * * /home/pi/mfri_scraper/venv/bin/python /home/pi/mfri_scraper/mfri_scraper.py >> /home/pi/mfri_scraper/cron.log 2>&1
