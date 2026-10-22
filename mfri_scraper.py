@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 MFRI Initial EMT (EMS-106) Schedule Monitor
-Hardened stateless scraper with flock concurrency control, verified TLS,
-DOM sanity checks, registration-open transition tracking, and atomic state saves.
+Stateless, systemd-ready scraper with verified Gmail TLS, DOM health checks,
+registration-open transition alerts, and atomic state persistence.
 """
 
 import argparse
@@ -65,9 +65,9 @@ DAYS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (Rotating File + Stdout for systemd journald)
 # ---------------------------------------------------------------------------
-def setup_logging(verbose: bool = False) -> logging.Logger:
+def setup_logging() -> logging.Logger:
     logger = logging.getLogger("mfri_scraper")
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter(
@@ -82,11 +82,9 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
         rotating_handler.setFormatter(formatter)
         logger.addHandler(rotating_handler)
 
-        # Only attach stdout handler if run interactively or --verbose is passed
-        if verbose or sys.stdout.isatty():
-            stream_handler = logging.StreamHandler(sys.stdout)
-            stream_handler.setFormatter(formatter)
-            logger.addHandler(stream_handler)
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
 
     return logger
 
@@ -107,7 +105,6 @@ def atomic_write_json(target_path: Path, payload: Dict[str, Any]) -> None:
             os.fsync(tmp_file.fileno())
         os.replace(temp_path, target_path)
 
-        # fsync parent directory entry for SD card power-loss resilience
         dir_fd = os.open(str(parent_dir), os.O_RDONLY)
         try:
             os.fsync(dir_fd)
@@ -150,10 +147,6 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 
 
 def load_seen_courses(state_path: Path, logger: logging.Logger) -> Dict[str, Dict[str, str]]:
-    """
-    Return dict mapping course_id -> {"status": str, "updated_at": str}.
-    If corrupted, preserve backup and raise RuntimeError to prevent re-alert floods.
-    """
     if not state_path.exists():
         return {}
 
@@ -164,13 +157,12 @@ def load_seen_courses(state_path: Path, logger: logging.Logger) -> Dict[str, Dic
         backup_path = state_path.with_suffix(state_path.suffix + ".bak")
         shutil.copy2(state_path, backup_path)
         logger.critical(
-            "State file %s is corrupted! Backed up to %s and aborting to prevent duplicate alert flood.",
+            "State file %s is corrupted! Backed up to %s and aborting to prevent duplicate alerts.",
             state_path,
             backup_path,
         )
         raise RuntimeError(f"Corrupted state file: {state_path}") from exc
 
-    # Backwards compatibility with older {"seen_ids": [...]} format
     if isinstance(data, dict) and "courses" in data and isinstance(data["courses"], dict):
         return data["courses"]
     if isinstance(data, dict) and "seen_ids" in data and isinstance(data["seen_ids"], list):
@@ -187,7 +179,7 @@ def save_seen_courses(
 def update_health(
     success: bool, error_msg: str, config: Dict[str, Any], logger: logging.Logger
 ) -> None:
-    """Track consecutive fetch/parse failures and send an admin alert at threshold."""
+    """Track consecutive fetch/parse failures and email an admin alert at threshold."""
     health = {"consecutive_failures": 0, "last_error": "", "alert_sent": False}
     if HEALTH_PATH.exists():
         try:
@@ -214,7 +206,7 @@ def update_health(
                 body=(
                     f"The MFRI EMT schedule scraper has failed {health['consecutive_failures']} "
                     f"consecutive times.\n\nLatest Error:\n{error_msg}\n\n"
-                    f"Please inspect {LOG_PATH} and verify {TARGET_URL}."
+                    f"Please inspect {LOG_PATH} or run 'journalctl -u mfri-scraper.service'."
                 ),
                 config=config,
                 logger=logger,
@@ -230,7 +222,7 @@ def update_health(
 
 
 # ---------------------------------------------------------------------------
-# HTTP Fetching with Backoff
+# HTTP Fetching & HTML Parsing
 # ---------------------------------------------------------------------------
 def fetch_html(
     test_mode: bool, mock_path: Path, config: Dict[str, Any], logger: logging.Logger
@@ -243,7 +235,7 @@ def fetch_html(
 
     headers = {
         "User-Agent": config.get(
-            "user_agent", "MFRI-EMT-ScheduleMonitor/2.0 (RaspberryPi)"
+            "user_agent", "MFRI-EMT-ScheduleMonitor/2.2 (RaspberryPi)"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -265,23 +257,18 @@ def fetch_html(
     return response.text
 
 
-# ---------------------------------------------------------------------------
-# HTML Parsing & Filtering
-# ---------------------------------------------------------------------------
 def clean_more_arrow(raw_text: str) -> str:
     text = re.sub(r"More\s*(?:→|&rarr;|\u2192).*", "", raw_text, flags=re.IGNORECASE)
     return " ".join(text.split()).strip()
 
 
 def is_initial_emt_course(block_text: str) -> bool:
-    """Authoritative filtering by EMS-106 course ID and explicit exclusion list."""
     if EXCLUDED_CODE_RE.search(block_text):
         return False
     return bool(INITIAL_EMT_ID_RE.search(block_text))
 
 
 def resolve_course_title(item_div: Tag) -> str:
-    """Use preceding <h2> as display metadata; default cleanly if absent."""
     h2 = item_div.find_previous("h2")
     if h2:
         cleaned = clean_more_arrow(h2.get_text(" ", strip=True))
@@ -291,7 +278,6 @@ def resolve_course_title(item_div: Tag) -> str:
 
 
 def extract_location(item_div: Tag) -> str:
-    """Extract location from the parent container of the /location link."""
     loc_link = item_div.find("a", href=re.compile(r"/location", re.IGNORECASE))
     if loc_link:
         container = loc_link.parent if loc_link.parent else loc_link
@@ -317,10 +303,6 @@ def extract_registration_info(
     reg_close_str: Optional[str],
     today: date,
 ) -> Dict[str, str]:
-    """
-    Determine accurate registration URL and status by inspecting both link text
-    ('Register' vs 'Wait List') and comparing Registration Open/Close dates to today.
-    """
     reg_url = TARGET_URL
     link_label = ""
 
@@ -499,7 +481,7 @@ def send_course_alert(
         f"Schedule URL          : {TARGET_URL}\n"
     )
     logger.info(
-        "Sending '%s' alert for %s (Status: %s)",
+        "Sending '%s' email for %s (Status: %s)",
         event_reason,
         course["course_id"],
         course["registration_status"],
@@ -528,23 +510,17 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Parse and log alerts without sending emails or modifying state files.",
+        help="Parse and log alerts without sending emails or modifying state.",
     )
     parser.add_argument(
         "--baseline",
         action="store_true",
-        help="Seed seen_courses.json with currently posted courses without sending emails.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Force log output to stdout even when non-interactive.",
+        help="Seed seen_courses.json with currently posted courses without emailing.",
     )
     args = parser.parse_args()
 
-    logger = setup_logging(verbose=args.verbose)
+    logger = setup_logging()
 
-    # 1. Prevent overlapping cron executions via non-blocking flock
     lock_file = LOCK_PATH.open("w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -565,7 +541,6 @@ def main() -> int:
     except RuntimeError:
         return 3
 
-    # 2. Fetch and parse HTML with health monitoring
     try:
         html_content = fetch_html(args.test, args.mock_file, config, logger)
         courses = parse_schedule_html(html_content, date.today(), logger)
@@ -577,9 +552,9 @@ def main() -> int:
             update_health(False, str(exc), config, logger)
         return 2
 
-    # 3. Baseline seeding mode (no emails sent)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
     if args.baseline:
-        now_iso = datetime.now().isoformat(timespec="seconds")
         for c in courses:
             seen_courses[c["course_id"]] = {
                 "status": c["registration_status"],
@@ -593,9 +568,7 @@ def main() -> int:
         )
         return 0
 
-    # 4. Evaluate new courses and Upcoming -> Open registration transitions
     smtp_failures = 0
-    now_iso = datetime.now().isoformat(timespec="seconds")
 
     for course in courses:
         cid = course["course_id"]
@@ -612,7 +585,6 @@ def main() -> int:
             event_reason = "REGISTRATION OPENED"
 
         if not event_reason:
-            # Quietly keep non-alerting status changes synced
             if not args.dry_run and prev_entry.get("status") != curr_status:
                 seen_courses[cid] = {"status": curr_status, "updated_at": now_iso}
                 save_seen_courses(state_path, seen_courses)
@@ -620,7 +592,7 @@ def main() -> int:
 
         if args.dry_run:
             logger.info(
-                "[DRY-RUN] Would alert '%s' for %s (%s at %s)",
+                "[DRY-RUN] Would email '%s' for %s (%s at %s)",
                 event_reason,
                 cid,
                 curr_status,
@@ -630,7 +602,6 @@ def main() -> int:
 
         try:
             send_course_alert(course, event_reason, config, logger)
-            # Save state immediately after each successful send
             seen_courses[cid] = {"status": curr_status, "updated_at": now_iso}
             save_seen_courses(state_path, seen_courses)
         except Exception as exc:

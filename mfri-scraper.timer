@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MFRI EMT Scraper every 30 minutes
+
+[Timer]
+OnCalendar=*:00/30
+RandomizedDelaySec=2m
+Persistent=true
+Unit=mfri-scraper.service
+
+[Install]
+WantedBy=timers.target

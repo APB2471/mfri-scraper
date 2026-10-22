@@ -1,0 +1,14 @@
+[Unit]
+Description=MFRI Initial EMT (EMS-106) Schedule Scraper
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/mfri_scraper
+ExecStart=/home/pi/mfri_scraper/venv/bin/python /home/pi/mfri_scraper/mfri_scraper.py
+TimeoutStartSec=90s
+StandardOutput=journal
+StandardError=journal
